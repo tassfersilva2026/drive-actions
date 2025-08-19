@@ -1,15 +1,17 @@
+# scripts/pdf27.py
 import os, re, glob, json, time, argparse, logging, hashlib
 from datetime import datetime, date
+from pathlib import Path
+
 import pdfplumber
 import pandas as pd
 from tqdm import tqdm
 from openpyxl.utils import get_column_letter
 
 # ── CONFIGS ───────────────────────────────────────────────────────────────────
-# LEMBRETE: no GitHub Actions use caminhos RELATIVOS
-from pathlib import Path
+# Caminhos RELATIVOS pro GitHub Actions
 ROOT = Path(".")
-PDF_DIR        = str(ROOT / "inbox")                       # onde os PDFs baixam
+PDF_DIR        = str(ROOT / "inbox")   # onde os PDFs baixam
 OUT_DIR        = ROOT / "out"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -20,17 +22,18 @@ PARQUET_ERR    = str(OUT_DIR / "OFERTASMATRIZ_ERROS.parquet")
 SHEET_OFERTAS  = "OFERTAS"
 SHEET_ERROS    = "ERRO_MONITORAMENTO"
 
-# Arquivos auxiliares (joguei pro out/)
+# Arquivos auxiliares
 ROW_IDS_FILE   = str(OUT_DIR / "OFERTASMATRIZ_ROW_IDS.txt")
 ERR_IDS_FILE   = str(OUT_DIR / "OFERTASMATRIZ_ERR_IDS.txt")
 STATE_JSON     = str(OUT_DIR / "OFERTASMATRIZ_STATE.json")
 
-# [NOVO] Parquet “final”
+# Parquet “final” pedido
 REPLACE_OFERTAS_PATH = str(OUT_DIR / "OFERTAS.parquet")
 
-# Loop do script original não será usado no Actions (vamos rodar --once)
+# (se você rodar sem --once) intervalo
 LOOP_INTERVAL_SEC = 10 * 60
 # ──────────────────────────────────────────────────────────────────────────────
+
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
 VALID_ENTITIES = {
@@ -64,11 +67,11 @@ PAGE_ERROR_PATTERNS = {
 }
 MONTH_MAP = {"jan":1,"fev":2,"mar":3,"abr":4,"mai":5,"jun":6,"jul":7,"ago":8,"set":9,"out":10,"nov":11,"dez":12}
 
-# ── Helpers de normalização/ID (hash) ─────────────────────────────────────────
+# ── Helpers de normalização/ID ────────────────────────────────────────────────
 OF_ID_COLS = [
     "Nome do Arquivo","Companhia Aérea","Horário1","Horário2","Horário3",
     "Tipo de Voo","Data do Voo","Data/Hora da Busca","Agência/Companhia",
-    "Preço","TRECHO","ADVP"   # Ranking de fora
+    "Preço","TRECHO","ADVP"
 ]
 ER_ID_COLS = ["Nome do Arquivo","Erro","Trecho","Pagina"]
 
@@ -118,16 +121,8 @@ def _hash_concat(df: pd.DataFrame, cols: list) -> pd.Series:
 def build_row_ids(df: pd.DataFrame) -> pd.Series: return _hash_concat(_canon_ofertas(df), OF_ID_COLS)
 def build_err_ids(df: pd.DataFrame) -> pd.Series: return _hash_concat(_canon_erros(df), ER_ID_COLS)
 
-# (REMOVIDO) Funções de cache/estado — mantidas apenas como no código original, porém não usadas.
-def load_id_cache(path: str) -> set:
-    return set()
-
-def append_id_cache(path: str, ids: pd.Series):
-    return
-
-# [INSERÇÃO] Cache simples de PDFs por mtime+tamanho ---------------------------
+# ── Estado simples (evitar reprocessar PDF igual) ─────────────────────────────
 def load_state() -> dict:
-    """Lê JSON de estado de PDFs processados (caminho -> assinatura)."""
     try:
         with open(STATE_JSON, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -135,14 +130,12 @@ def load_state() -> dict:
         return {}
 
 def save_state(state: dict):
-    """Grava JSON de estado."""
     try:
         os.makedirs(os.path.dirname(STATE_JSON), exist_ok=True)
         with open(STATE_JSON, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
-# -----------------------------------------------------------------------------
 
 # ── Extração PDF ──────────────────────────────────────────────────────────────
 def first_page_error_code(pdf_path):
@@ -248,7 +241,6 @@ def write_back_preserving(file_path, df_ofertas, df_erros):
     with pd.ExcelWriter(file_path, engine="openpyxl", mode=mode, if_sheet_exists=("replace" if mode=="a" else None)) as writer:
         df_ofertas.to_excel(writer, index=False, sheet_name=SHEET_OFERTAS)
         df_erros.to_excel(writer, index=False, sheet_name=SHEET_ERROS)
-        # formatar datas como DD/MM/YYYY na planilha OFERTAS
         ws = writer.sheets[SHEET_OFERTAS]
         cols = list(df_ofertas.columns)
         for col_name in ["Data do Voo","Data/Hora da Busca"]:
@@ -258,7 +250,6 @@ def write_back_preserving(file_path, df_ofertas, df_erros):
                 for cell in ws[letter][1:]:
                     cell.number_format = "DD/MM/YYYY"
 
-# [NOVO] escrita segura do arquivo OFERTAS.parquet pedido pela Tassi
 def _replace_ofertas_parquet_safely(ofertas_df: pd.DataFrame):
     try:
         os.makedirs(os.path.dirname(REPLACE_OFERTAS_PATH), exist_ok=True)
@@ -273,28 +264,23 @@ def _replace_ofertas_parquet_safely(ofertas_df: pd.DataFrame):
         print(f"⚠️ Falha ao substituir {REPLACE_OFERTAS_PATH}: {e}")
 
 def export_parquet(ofertas_df, erros_df):
-    # Converte datas pro tipo datetime64[ns] no Parquet
     of = ofertas_df.copy()
     for c in ["Data do Voo","Data/Hora da Busca"]:
         if c in of: of[c] = pd.to_datetime(of[c], errors="coerce")
-    of.to_parquet(PARQUET_OFS, index=False)      # requer pyarrow
+    of.to_parquet(PARQUET_OFS, index=False)
     if erros_df is not None and not erros_df.empty:
         er = erros_df.copy()
         er.to_parquet(PARQUET_ERR, index=False)
-
-    # [NOVO] sempre substituir o OFERTAS.parquet final pedido
-    if of is not None:
-        _replace_ofertas_parquet_safely(of)
+    _replace_ofertas_parquet_safely(of)
 
 # ── 1 ciclo de atualização ────────────────────────────────────────────────────
 def run_cycle():
-    # (REMOVIDO) state/cache; processa TODOS os PDFs sempre
     pdfs = sorted(glob.glob(os.path.join(PDF_DIR, "*.pdf")))
-    print(f"[{datetime.now():%H:%M:%S}] PDFs na pasta: {len(pdfs)} | Processando todos (sem cache)")
+    print(f"[{datetime.now():%H:%M:%S}] PDFs na pasta: {len(pdfs)}")
     if not pdfs:
-        return None, None, 0, 0
+        return pd.DataFrame(), pd.DataFrame(), 0, 0
 
-    # [INSERÇÃO] Seleciona apenas PDFs novos/alterados (cache por mtime+tamanho)
+    # Cache simples (mtime+tamanho) para processar só novos/alterados
     state = load_state()
     def _sig(p: str) -> str | None:
         try:
@@ -302,6 +288,7 @@ def run_cycle():
             return f"{st.st_size}-{int(st.st_mtime)}"
         except Exception:
             return None
+
     to_process = []
     for p in pdfs:
         sig = _sig(p)
@@ -309,14 +296,15 @@ def run_cycle():
             continue
         if state.get(p) != sig:
             to_process.append(p)
+
     if not to_process:
         print(f"[{datetime.now():%H:%M:%S}] Nada novo. Todos os PDFs já convertidos.")
         return pd.DataFrame(), pd.DataFrame(), 0, 0
+
     print(f"[{datetime.now():%H:%M:%S}] Novos/alterados: {len(to_process)} de {len(pdfs)}")
 
     offers_rows, errors_rows = [], []
-
-    for path in tqdm(to_process, desc="Processando PDFs"):   # [INSERÇÃO] usa to_process
+    for path in tqdm(to_process, desc="Processando PDFs"):
         fn = os.path.basename(path)
 
         code, trecho = first_page_error_code(path)
@@ -332,33 +320,21 @@ def run_cycle():
             offers_rows.append({
                 "Nome do Arquivo": fn,
                 **(flight_info or {}),
-                "Data/Hora da Busca": sdt,  # ex: "09/08/2025, 13:13"
+                "Data/Hora da Busca": sdt,
                 **o,
                 "TRECHO": get_trecho(fn)
             })
 
-    # DataFrames novos
     new_offers_df = pd.DataFrame(offers_rows)
     new_erros_df  = pd.DataFrame(errors_rows)
 
-    # ── OFERTAS: datas, ADVP (subtração direta), ranking, filtros, maiúsculo ──
+    # OFERTAS: datas, ADVP, ranking, filtros, maiúsculo
     if not new_offers_df.empty:
-        new_offers_df["Data do Voo"] = pd.to_datetime(
-            new_offers_df["Data do Voo"], dayfirst=True, errors="coerce"
-        )
-        so_data = new_offers_df["Data/Hora da Busca"].astype(str).str.extract(
-            r"(\d{2}/\d{2}/\d{4})", expand=False
-        )
-        new_offers_df["Data/Hora da Busca"] = pd.to_datetime(
-            so_data, dayfirst=True, errors="coerce"
-        )
-
-        diff_days = (
-            new_offers_df["Data do Voo"].dt.normalize()
-            - new_offers_df["Data/Hora da Busca"].dt.normalize()
-        ).dt.days
+        new_offers_df["Data do Voo"] = pd.to_datetime(new_offers_df["Data do Voo"], dayfirst=True, errors="coerce")
+        so_data = new_offers_df["Data/Hora da Busca"].astype(str).str.extract(r"(\d{2}/\d{2}/\d{4})", expand=False)
+        new_offers_df["Data/Hora da Busca"] = pd.to_datetime(so_data, dayfirst=True, errors="coerce")
+        diff_days = (new_offers_df["Data do Voo"].dt.normalize() - new_offers_df["Data/Hora da Busca"].dt.normalize()).dt.days
         new_offers_df["ADVP"] = diff_days.fillna(0).astype(int)
-
         new_offers_df = rank_prices(new_offers_df)
 
         req = ["Nome do Arquivo","Companhia Aérea","Horário1","Horário2","Horário3",
@@ -366,14 +342,12 @@ def run_cycle():
                "Agência/Companhia","Preço","TRECHO","ADVP","Ranking"]
         new_offers_df = new_offers_df[new_offers_df.apply(lambda r: todas_colunas_preenchidas(r, req), axis=1)]
         new_offers_df = new_offers_df[new_offers_df["Agência/Companhia"].str.lower() != "skyscanner"]
-
         new_offers_df = to_upper_df(new_offers_df)
 
-    # ── ERROS: maiúsculo ──
     if not new_erros_df.empty:
         new_erros_df = to_upper_df(new_erros_df)
 
-    # Carrega base atual
+    # Base atual (se existir)
     try: base_ofertas = pd.read_excel(MATRIX_XLSX, sheet_name=SHEET_OFERTAS, engine="openpyxl")
     except: base_ofertas = pd.DataFrame()
     try: base_erros = pd.read_excel(MATRIX_XLSX, sheet_name=SHEET_ERROS, engine="openpyxl")
@@ -405,148 +379,17 @@ def run_cycle():
         ofertas_set = set(final_ofertas["Nome do Arquivo"].dropna().astype(str)) if "Nome do Arquivo" in final_ofertas else set()
         final_erros["EM_AMBAS"] = final_erros["Nome do Arquivo"].apply(lambda x: "SIM" if str(x) in ofertas_set else "NÃO")
 
-    # Grava Excel + Parquet (sempre que há algo novo OU base vazia)
+    # Grava Excel + Parquet (quando tem algo novo, ou base vazia)
     if not novos_unicos.empty or not new_errs_unique.empty or base_ofertas.empty or base_erros.empty:
         write_back_preserving(MATRIX_XLSX, final_ofertas, final_erros)
         export_parquet(final_ofertas, final_erros)
 
-    # [INSERÇÃO] Atualiza o cache de PDFs processados
+    # Atualiza cache
+    state = load_state()
     for p in to_process:
         try:
             st = os.stat(p)
             state[p] = f"{st.st_size}-{int(st.st_mtime)}"
         except Exception:
             pass
-    save_state(state)
-
-    return final_ofertas, final_erros, len(novos_unicos), len(new_errs_unique)
-
-# ── CLI / Execução ────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--once", action="store_true", help="Executa apenas 1 ciclo.")
-    args = ap.parse_args()
-
-    if args.once:
-        of_df, er_df, n_of, n_er = run_cycle()
-        print(f"✅ Ciclo concluído. Ofertas novas: {n_of} | Erros novos: {n_er}")
-    else:
-        # [NOVO] Loop de 10 em 10 minutos
-        while True:
-            try:
-                start = datetime.now()
-                of_df, er_df, n_of, n_er = run_cycle()
-                print(f"✅ Ciclo concluído {start:%d/%m %H:%M:%S}. Ofertas novas: {n_of} | Erros novos: {n_er}")
-            except Exception as e:
-                print(f"❌ Erro no ciclo: {e}")
-            print(f"⏲️ Próxima execução em 10 minutos ({(datetime.now() + pd.Timedelta(seconds=LOOP_INTERVAL_SEC)):%H:%M:%S})")
-            time.sleep(LOOP_INTERVAL_SEC)
-
-# =====================================================================
-# convert_ofertasmatriz_to_parquet.py  (mantido como no original)
-# Lê OFERTASMATRIZ.* na pasta dada, pega a aba "OFERTAS" (se existir)
-# e salva como OFERTAS.parquet no mesmo diretório.
-# =====================================================================
-
-import glob
-import sys
-import json  # [INSERÇÃO]
-
-BASE_DIR = r"C:\Users\tassiana.silva\Downloads\teste"
-BASENAME = "OFERTASMATRIZ"          # vamos procurar OFERTASMATRIZ.xlsx/.xlsm/.xlsb/.xls
-OUT_NAME = "OFERTAS.parquet"        # nome do arquivo parquet de saída
-ALLOWED_EXT = (".xlsx", ".xlsm", ".xlsb", ".xls")
-
-# [INSERÇÃO] Cache do conversor (evita reconverter arquivo idêntico)
-CONV_STATE = os.path.join(BASE_DIR, "OFERTAS_CONVERT_STATE.json")
-
-def _load_conv_state() -> dict:   # [INSERÇÃO]
-    try:
-        with open(CONV_STATE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def _save_conv_state(state: dict):  # [INSERÇÃO]
-    try:
-        with open(CONV_STATE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-def _sig(path: str) -> str | None:  # [INSERÇÃO]
-    try:
-        st = os.stat(path)
-        return f"{st.st_size}-{int(st.st_mtime)}"
-    except Exception:
-        return None
-
-def find_input_file(base_dir: str, basename: str) -> str | None:
-    # tenta pelos formatos mais comuns
-    for ext in ALLOWED_EXT:
-        path = os.path.join(base_dir, basename + ext)
-        if os.path.exists(path):
-            return path
-    # fallback: qualquer extensão que exista com esse basename
-    hits = sorted(glob.glob(os.path.join(base_dir, basename + ".*")))
-    return hits[0] if hits else None
-
-def read_ofertas_sheet(xls_path: str) -> pd.DataFrame:
-    # Abre o Excel e usa a aba "OFERTAS" se existir; senão, a primeira aba
-    try:
-        xl = pd.ExcelFile(xls_path)
-    except Exception as e:
-        print(f"❌ Não consegui abrir '{xls_path}': {e}")
-        sys.exit(1)
-
-    # Procura por 'OFERTAS' ignorando maiúsc/minúsc
-    oferta_sheet = None
-    for s in xl.sheet_names:
-        if s.strip().upper() == "OFERTAS":
-            oferta_sheet = s
-            break
-    sheet_to_use = oferta_sheet if oferta_sheet else xl.sheet_names[0]
-
-    print(f"→ Lendo aba: {sheet_to_use}")
-    df = xl.parse(sheet_to_use)
-    return df
-
-def main():
-    in_file = find_input_file(BASE_DIR, BASENAME)
-    if not in_file:
-        print(f"❌ Arquivo '{BASENAME}.*' não encontrado em {BASE_DIR}.")
-        sys.exit(1)
-
-    print(f"→ Arquivo encontrado: {in_file}")
-
-    # [INSERÇÃO] Verifica cache: só converte se o arquivo mudou
-    state = _load_conv_state()
-    in_sig = _sig(in_file)
-    out_path = os.path.join(BASE_DIR, OUT_NAME)
-    if in_sig and state.get("input_sig") == in_sig and os.path.exists(out_path):
-        print(f"⏭️  Nada novo para converter. Fonte inalterada e '{OUT_NAME}' já existe.")
-        print(f"   Fonte: {in_file} | Sinal: {in_sig}")
-        print(f"   Saída: {out_path}")
-        return
-
-    df = read_ofertas_sheet(in_file)
-
-    # Conversão de tipos amigável ao Parquet (opcional)
-    df = df.convert_dtypes()
-
-    try:
-        df.to_parquet(out_path, engine="pyarrow", compression="snappy", index=False)
-    except Exception as e:
-        print("❌ Falhou ao salvar Parquet. Verifique se 'pyarrow' está instalado (pip install pyarrow).")
-        print(f"Detalhes: {e}")
-        sys.exit(1)
-
-    # [INSERÇÃO] Atualiza cache do conversor
-    state["input_sig"] = in_sig
-    state["output_path"] = out_path
-    _save_conv_state(state)
-
-    print(f"✅ Salvo: {out_path}  | Linhas: {len(df)}")
-
-if __name__ == "__main__":
-    main()
+    save_state(sta_
