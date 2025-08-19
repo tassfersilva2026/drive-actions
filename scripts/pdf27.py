@@ -16,20 +16,21 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Saídas
 MATRIX_XLSX    = str(OUT_DIR / "OFERTASMATRIZ.xlsx")
-PARQUET_INC    = str(OUT_DIR / "OFERTASMATRIZ_OFERTAS.parquet")   # <-- incremento (novas pesquisas)
+PARQUET_INC    = str(OUT_DIR / "OFERTASMATRIZ_OFERTAS.parquet")   # incremento
 PARQUET_ERR    = str(OUT_DIR / "OFERTASMATRIZ_ERROS.parquet")
-MASTER_OUT     = str(OUT_DIR / "OFERTAS.parquet")                 # <-- base-mãe (atualizada aqui)
+MASTER_OUT     = str(OUT_DIR / "OFERTAS.parquet")                 # base-mãe atualizada aqui
 
-# Locais possíveis da base-mãe já versionada no repo
-MASTER_CANDIDATES = [Path("data/OFERTAS.parquet"), Path("OFERTAS.parquet")]
+# Base-mãe já versionada (prioriza raiz)
+MASTER_CANDIDATES = [
+    Path("OFERTAS.parquet"),
+    Path("data/OFERTAS.parquet"),
+    Path("out/OFERTAS.parquet"),
+]
 
 SHEET_OFERTAS  = "OFERTAS"
 SHEET_ERROS    = "ERRO_MONITORAMENTO"
 
-# Arquivos auxiliares
 STATE_JSON     = str(OUT_DIR / "OFERTASMATRIZ_STATE.json")
-
-# Intervalo do modo loop (não usado no Actions, só se rodar local sem --once)
 LOOP_INTERVAL_SEC = 10 * 60
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -269,22 +270,15 @@ def _dedup_by_id(df: pd.DataFrame) -> pd.DataFrame:
     return tmp
 
 def export_increment_and_update_master(increment_df: pd.DataFrame):
-    """
-    - Salva o incremento (novos registros) em PARQUET_INC
-    - Lê base-mãe existente (se houver), concatena incremento e deduplica por ID
-    - Salva base-mãe atualizada em MASTER_OUT (será comitada pelo workflow)
-    """
-    # Incremento (pode estar vazio)
+    # Salva incremento
     inc = increment_df.copy()
     if not inc.empty:
         _to_datetime_cols(inc).to_parquet(PARQUET_INC, index=False)
     else:
-        # cria arquivo vazio consistente
         pd.DataFrame(columns=OF_ID_COLS).to_parquet(PARQUET_INC, index=False)
 
-    # Base-mãe atual + merge com incremento
+    # Merge com base-mãe e dedupe
     master = _load_master_df()
-    # Harmoniza colunas
     all_cols = sorted(set(list(master.columns) + list(inc.columns)))
     if not master.empty:
         for c in all_cols:
@@ -298,7 +292,6 @@ def export_increment_and_update_master(increment_df: pd.DataFrame):
     merged = pd.concat([master, inc], ignore_index=True)
     merged = _dedup_by_id(merged)
 
-    # Ordena (opcional): por Data/Hora da Busca desc, depois Preço asc
     if "Data/Hora da Busca" in merged:
         merged = merged.sort_values(by=["Data/Hora da Busca","Preço"], ascending=[False, True], ignore_index=True)
 
@@ -309,7 +302,6 @@ def run_cycle():
     pdfs = sorted(glob.glob(os.path.join(PDF_DIR, "*.pdf")))
     print(f"[{datetime.now():%H:%M:%S}] PDFs na pasta: {len(pdfs)}")
     if not pdfs:
-        # Ainda assim, garante que master-out exista (copiando master atual, se houver)
         master = _load_master_df()
         if not master.empty:
             _save_master_out(master)
@@ -334,7 +326,6 @@ def run_cycle():
 
     if not to_process:
         print(f"[{datetime.now():%H:%M:%S}] Nada novo. Todos os PDFs já convertidos.")
-        # Ainda assim, mantenha o master atualizado a partir do que já existe no repo
         master = _load_master_df()
         if not master.empty:
             _save_master_out(master)
@@ -364,11 +355,9 @@ def run_cycle():
                 "TRECHO": get_trecho(fn)
             })
 
-    # DataFrames “novos”
     new_offers_df = pd.DataFrame(offers_rows)
     new_erros_df  = pd.DataFrame(errors_rows)
 
-    # Limpeza, ADVP, ranking, filtros
     if not new_offers_df.empty:
         new_offers_df["Data do Voo"] = pd.to_datetime(new_offers_df["Data do Voo"], dayfirst=True, errors="coerce")
         so_data = new_offers_df["Data/Hora da Busca"].astype(str).str.extract(r"(\d{2}/\d{2}/\d{4})", expand=False)
@@ -387,7 +376,7 @@ def run_cycle():
     if not new_erros_df.empty:
         new_erros_df = to_upper_df(new_erros_df)
 
-    # Grava Excel incremental + Parquet de erros
+    # Excel e erros parquet (auditoria)
     try:
         base_ofertas = pd.read_excel(MATRIX_XLSX, sheet_name=SHEET_OFERTAS, engine="openpyxl")
     except Exception:
@@ -399,18 +388,15 @@ def run_cycle():
 
     final_ofertas = pd.concat([base_ofertas, new_offers_df], ignore_index=True) if not new_offers_df.empty else base_ofertas
     final_erros   = pd.concat([base_erros, new_erros_df], ignore_index=True) if not new_erros_df.empty else base_erros
-
-    # Excel e erros parquet (meramente para auditoria)
     if not final_ofertas.empty or base_ofertas.empty:
         write_back_preserving(MATRIX_XLSX, final_ofertas, final_erros)
     if not new_erros_df.empty:
         _to_datetime_cols(new_erros_df).to_parquet(PARQUET_ERR, index=False)
 
-    # >>> NOVO: salva incremento e atualiza base-mãe sem duplicar
+    # incremento + atualizar base-mãe (dedupe)
     export_increment_and_update_master(new_offers_df)
 
-    # Atualiza cache
-    state = load_state()
+    # cache
     for p in to_process:
         try:
             st = os.stat(p)
