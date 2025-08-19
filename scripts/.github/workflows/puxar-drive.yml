@@ -1,0 +1,39 @@
+name: Puxar arquivos do Drive
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"    # a cada 10 minutos (UTC)
+  workflow_dispatch:          # botão manual
+
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Escrever credencial da Service Account
+        env:
+          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+        run: |
+          echo "$GDRIVE_SA_JSON" > sa.json
+
+      - name: Baixar do Drive
+        env:
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+        run: |
+          python scripts/drive_pull.py
+
+      - name: Publicar arquivos como Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: drive-inbox
+          path: inbox/**
