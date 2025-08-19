@@ -1,50 +1,58 @@
 name: publish-ofertas-from-artifact
 
 on:
-  # Dispara sempre que o seu workflow principal terminar
   workflow_run:
-    workflows: ["Puxar arquivos do Drive"]  # <-- NOME exato do seu workflow
+    workflows: ["Puxar arquivos do Drive"]
     types: [completed]
-  # E também permite rodar manualmente
   workflow_dispatch: {}
 
 permissions:
+  actions: read          # <-- ESSENCIAL pra listar/baixar artifacts de outras runs
   contents: read
   pages: write
   id-token: write
 
 jobs:
   fetch-and-publish:
-    # Só publica se a run do gerador terminou com sucesso
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      - name: Baixar artifact da execução geradora
+      # Quando for disparado automaticamente por workflow_run,
+      # baixa o artifact daquela execução:
+      - name: Download artifact (triggered run)
+        if: ${{ github.event_name == 'workflow_run' }}
         uses: dawidd6/action-download-artifact@v6
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           run_id: ${{ github.event.workflow_run.id }}
-          name: converted-files                # <-- NOME do artifact que você já faz upload (out/**)
+          name: converted-files
           path: download
           if_no_artifact_found: fail
 
-      - name: Preparar site (extrai ZIP e copia .parquet)
+      # Quando rodar manualmente, pega o último sucesso do workflow:
+      - name: Download latest successful artifact (manual)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: "Puxar arquivos do Drive"
+          workflow_conclusion: success
+          branch: main
+          name: converted-files
+          path: download
+          if_no_artifact_found: fail
+
+      - name: Prepare site
         run: |
           set -e
-          sudo apt-get update && sudo apt-get install -y unzip
-          mkdir -p site extracted
-          # Alguns providers empacotam como .zip; vamos extrair tudo
-          for z in $(find download -type f -name '*.zip'); do
-            unzip -o "$z" -d extracted
-          done
-          # Procura o OFERTAS.parquet; se não tiver exatamente esse nome, pega o primeiro .parquet
-          PARQ=$(find download extracted -type f -name 'OFERTAS.parquet' -o -name '*.parquet' | head -n 1 || true)
+          mkdir -p site
+          PARQ=$(find download -type f -name 'OFERTAS.parquet' -o -name '*.parquet' | head -n1 || true)
           if [ -z "$PARQ" ]; then
             echo "Nenhum .parquet encontrado no artifact"; exit 1
           fi
           cp "$PARQ" site/OFERTAS.parquet
 
-      - name: Upload para Pages
+      - name: Upload to Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: site
