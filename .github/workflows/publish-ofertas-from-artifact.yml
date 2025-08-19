@@ -1,0 +1,58 @@
+name: publish-ofertas-from-artifact
+
+on:
+  # Dispara sempre que o seu workflow principal terminar
+  workflow_run:
+    workflows: ["Puxar arquivos do Drive"]  # <-- NOME exato do seu workflow
+    types: [completed]
+  # E também permite rodar manualmente
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  fetch-and-publish:
+    # Só publica se a run do gerador terminou com sucesso
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar artifact da execução geradora
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          run_id: ${{ github.event.workflow_run.id }}
+          name: converted-files                # <-- NOME do artifact que você já faz upload (out/**)
+          path: download
+          if_no_artifact_found: fail
+
+      - name: Preparar site (extrai ZIP e copia .parquet)
+        run: |
+          set -e
+          sudo apt-get update && sudo apt-get install -y unzip
+          mkdir -p site extracted
+          # Alguns providers empacotam como .zip; vamos extrair tudo
+          for z in $(find download -type f -name '*.zip'); do
+            unzip -o "$z" -d extracted
+          done
+          # Procura o OFERTAS.parquet; se não tiver exatamente esse nome, pega o primeiro .parquet
+          PARQ=$(find download extracted -type f -name 'OFERTAS.parquet' -o -name '*.parquet' | head -n 1 || true)
+          if [ -z "$PARQ" ]; then
+            echo "Nenhum .parquet encontrado no artifact"; exit 1
+          fi
+          cp "$PARQ" site/OFERTAS.parquet
+
+      - name: Upload para Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: fetch-and-publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
