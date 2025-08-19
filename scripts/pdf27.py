@@ -1,3 +1,10 @@
+import os, re, glob, json, time, argparse, logging, hashlib
+from datetime import datetime, date
+import pdfplumber
+import pandas as pd
+from tqdm import tqdm
+from openpyxl.utils import get_column_letter
+
 # ── CONFIGS ───────────────────────────────────────────────────────────────────
 # LEMBRETE: no GitHub Actions use caminhos RELATIVOS
 from pathlib import Path
