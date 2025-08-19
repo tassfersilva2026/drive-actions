@@ -3,11 +3,12 @@ name: Puxar arquivos do Drive
 on:
   schedule:
     - cron: "*/10 * * * *"    # a cada 10 minutos (UTC)
-  workflow_dispatch:          # botão manual
+  workflow_dispatch:          # permite rodar manualmente
 
 jobs:
   pull:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,14 +27,29 @@ jobs:
         run: |
           echo "$GDRIVE_SA_JSON" > sa.json
 
-      - name: Baixar do Drive
+      - name: Baixar do Drive (limitado)
         env:
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          MAX_FILES: "50"      # pega no máx. 50 arquivos
+          SINCE_HOURS: "72"    # dos últimos 3 dias
         run: |
           python scripts/drive_pull.py
 
-      - name: Publicar arquivos como Artifact
+      - name: Converter PDFs com meu script (gera Parquet/XLSX)
+        run: |
+          mkdir -p out
+          python scripts/pdf27.py --once
+
+      - name: Publicar originais como Artifact
         uses: actions/upload-artifact@v4
         with:
           name: drive-inbox
           path: inbox/**
+          if-no-files-found: warn
+
+      - name: Publicar convertidos como Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: converted-files
+          path: out/**
+          if-no-files-found: warn
