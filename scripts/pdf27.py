@@ -1,6 +1,6 @@
 # scripts/pdf27.py
 import os, re, glob, json, time, argparse, logging, hashlib
-from datetime import datetime, date
+from datetime import datetime
 from pathlib import Path
 
 import pdfplumber
@@ -14,18 +14,22 @@ PDF_DIR        = str(ROOT / "inbox")   # onde os PDFs baixam
 OUT_DIR        = ROOT / "out"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# Saídas
 MATRIX_XLSX    = str(OUT_DIR / "OFERTASMATRIZ.xlsx")
-PARQUET_OFS    = str(OUT_DIR / "OFERTASMATRIZ_OFERTAS.parquet")
+PARQUET_INC    = str(OUT_DIR / "OFERTASMATRIZ_OFERTAS.parquet")   # <-- incremento (novas pesquisas)
 PARQUET_ERR    = str(OUT_DIR / "OFERTASMATRIZ_ERROS.parquet")
-REPLACE_OFERTAS_PATH = str(OUT_DIR / "OFERTAS.parquet")
+MASTER_OUT     = str(OUT_DIR / "OFERTAS.parquet")                 # <-- base-mãe (atualizada aqui)
+
+# Locais possíveis da base-mãe já versionada no repo
+MASTER_CANDIDATES = [Path("data/OFERTAS.parquet"), Path("OFERTAS.parquet")]
 
 SHEET_OFERTAS  = "OFERTAS"
 SHEET_ERROS    = "ERRO_MONITORAMENTO"
 
-ROW_IDS_FILE   = str(OUT_DIR / "OFERTASMATRIZ_ROW_IDS.txt")
-ERR_IDS_FILE   = str(OUT_DIR / "OFERTASMATRIZ_ERR_IDS.txt")
+# Arquivos auxiliares
 STATE_JSON     = str(OUT_DIR / "OFERTASMATRIZ_STATE.json")
 
+# Intervalo do modo loop (não usado no Actions, só se rodar local sem --once)
 LOOP_INTERVAL_SEC = 10 * 60
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -61,49 +65,41 @@ PAGE_ERROR_PATTERNS = {
 }
 MONTH_MAP = {"jan":1,"fev":2,"mar":3,"abr":4,"mai":5,"jun":6,"jul":7,"ago":8,"set":9,"out":10,"nov":11,"dez":12}
 
+# ── Chave de identidade para deduplicação ─────────────────────────────────────
 OF_ID_COLS = [
     "Nome do Arquivo","Companhia Aérea","Horário1","Horário2","Horário3",
     "Tipo de Voo","Data do Voo","Data/Hora da Busca","Agência/Companhia",
     "Preço","TRECHO","ADVP"
 ]
-ER_ID_COLS = ["Nome do Arquivo","Erro","Trecho","Pagina"]
 
 def to_upper_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty: return df
     return df.applymap(lambda x: x.upper() if isinstance(x, str) else x)
 
-def _fmt_date_series(s: pd.Series) -> pd.Series:
+def _fmt_date_series_ddmmyyyy(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s, dayfirst=True, errors="coerce").dt.strftime("%d/%m/%Y").fillna("")
 
-def _fmt_price_series(s: pd.Series) -> pd.Series:
+def _fmt_price_series_str(s: pd.Series) -> pd.Series:
     s2 = pd.to_numeric(s, errors="coerce").round(2)
     return s2.map(lambda x: f"{x:.2f}" if pd.notna(x) else "").astype(str)
 
 def _canon_ofertas(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty: 
+        return pd.DataFrame(columns=OF_ID_COLS)
     c = df.copy()
     for col in ["Nome do Arquivo","Companhia Aérea","Horário1","Horário2","Horário3",
                 "Tipo de Voo","Agência/Companhia","TRECHO"]:
         if col in c: c[col] = c[col].astype(str).str.strip().str.upper()
-    if "Data do Voo" in c:            c["Data do Voo"] = _fmt_date_series(c["Data do Voo"])
+    if "Data do Voo" in c:            c["Data do Voo"] = _fmt_date_series_ddmmyyyy(c["Data do Voo"])
     if "Data/Hora da Busca" in c:
         so_data = c["Data/Hora da Busca"].astype(str).str.extract(r"(\d{2}/\d{2}/\d{4})", expand=False)
-        c["Data/Hora da Busca"] = _fmt_date_series(so_data)
-    if "Preço" in c:                  c["Preço"] = _fmt_price_series(c["Preço"])
+        c["Data/Hora da Busca"] = _fmt_date_series_ddmmyyyy(so_data)
+    if "Preço" in c:                  c["Preço"] = _fmt_price_series_str(c["Preço"])
     if "ADVP" in c:                   c["ADVP"] = pd.to_numeric(c["ADVP"], errors="coerce").fillna(0).astype(int).astype(str)
     for col in OF_ID_COLS:
         if col not in c: c[col] = ""
         c[col] = c[col].fillna("")
-    return c
-
-def _canon_erros(df: pd.DataFrame) -> pd.DataFrame:
-    c = df.copy()
-    for col in ["Nome do Arquivo","Erro","Trecho"]:
-        if col in c: c[col] = c[col].astype(str).str.strip().str.upper()
-    if "Pagina" in c: c["Pagina"] = pd.to_numeric(c["Pagina"], errors="coerce").fillna(1).astype(int).astype(str)
-    for col in ER_ID_COLS:
-        if col not in c: c[col] = ""
-        c[col] = c[col].fillna("")
-    return c
+    return c[OF_ID_COLS]
 
 def _hash_concat(df: pd.DataFrame, cols: list) -> pd.Series:
     s = df[cols[0]].astype(str)
@@ -111,8 +107,9 @@ def _hash_concat(df: pd.DataFrame, cols: list) -> pd.Series:
         s = s.str.cat(df[col].astype(str), sep="||")
     return s.map(lambda t: hashlib.sha1(t.encode("utf-8")).hexdigest())
 
-def build_row_ids(df: pd.DataFrame) -> pd.Series: return _hash_concat(_canon_ofertas(df), OF_ID_COLS)
-def build_err_ids(df: pd.DataFrame) -> pd.Series: return _hash_concat(_canon_erros(df), ER_ID_COLS)
+def build_row_ids(df: pd.DataFrame) -> pd.Series:
+    base = _canon_ofertas(df)
+    return _hash_concat(base, OF_ID_COLS)
 
 # ── Estado simples (evitar reprocessar PDF igual) ─────────────────────────────
 def load_state() -> dict:
@@ -243,34 +240,79 @@ def write_back_preserving(file_path, df_ofertas, df_erros):
                 for cell in ws[letter][1:]:
                     cell.number_format = "DD/MM/YYYY"
 
-def _replace_ofertas_parquet_safely(ofertas_df: pd.DataFrame):
-    try:
-        os.makedirs(os.path.dirname(REPLACE_OFERTAS_PATH), exist_ok=True)
-        tmp_path = REPLACE_OFERTAS_PATH + ".tmp"
-        of = ofertas_df.copy()
-        for c in ["Data do Voo","Data/Hora da Busca"]:
-            if c in of: of[c] = pd.to_datetime(of[c], errors="coerce")
-        of.to_parquet(tmp_path, index=False)
-        os.replace(tmp_path, REPLACE_OFERTAS_PATH)
-        print(f"💾 Substituído: {REPLACE_OFERTAS_PATH} | Linhas: {len(of)}")
-    except Exception as e:
-        print(f"⚠️ Falha ao substituir {REPLACE_OFERTAS_PATH}: {e}")
-
-def export_parquet(ofertas_df, erros_df):
-    of = ofertas_df.copy()
+def _to_datetime_cols(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
     for c in ["Data do Voo","Data/Hora da Busca"]:
-        if c in of: of[c] = pd.to_datetime(of[c], errors="coerce")
-    of.to_parquet(PARQUET_OFS, index=False)
-    if erros_df is not None and not erros_df.empty:
-        er = erros_df.copy()
-        er.to_parquet(PARQUET_ERR, index=False)
-    _replace_ofertas_parquet_safely(of)
+        if c in out:
+            out[c] = pd.to_datetime(out[c], errors="coerce")
+    return out
+
+def _load_master_df() -> pd.DataFrame:
+    for p in MASTER_CANDIDATES:
+        if p.exists():
+            try:
+                return pd.read_parquet(p)
+            except Exception:
+                pass
+    return pd.DataFrame()
+
+def _save_master_out(df: pd.DataFrame):
+    df2 = _to_datetime_cols(df)
+    df2.to_parquet(MASTER_OUT, index=False)
+
+def _dedup_by_id(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    tmp = df.copy()
+    tmp["__id__"] = build_row_ids(tmp)
+    tmp = tmp.drop_duplicates("__id__", keep="last").drop(columns="__id__")
+    return tmp
+
+def export_increment_and_update_master(increment_df: pd.DataFrame):
+    """
+    - Salva o incremento (novos registros) em PARQUET_INC
+    - Lê base-mãe existente (se houver), concatena incremento e deduplica por ID
+    - Salva base-mãe atualizada em MASTER_OUT (será comitada pelo workflow)
+    """
+    # Incremento (pode estar vazio)
+    inc = increment_df.copy()
+    if not inc.empty:
+        _to_datetime_cols(inc).to_parquet(PARQUET_INC, index=False)
+    else:
+        # cria arquivo vazio consistente
+        pd.DataFrame(columns=OF_ID_COLS).to_parquet(PARQUET_INC, index=False)
+
+    # Base-mãe atual + merge com incremento
+    master = _load_master_df()
+    # Harmoniza colunas
+    all_cols = sorted(set(list(master.columns) + list(inc.columns)))
+    if not master.empty:
+        for c in all_cols:
+            if c not in master.columns: master[c] = pd.NA
+        master = master[all_cols]
+    if not inc.empty:
+        for c in all_cols:
+            if c not in inc.columns: inc[c] = pd.NA
+        inc = inc[all_cols]
+
+    merged = pd.concat([master, inc], ignore_index=True)
+    merged = _dedup_by_id(merged)
+
+    # Ordena (opcional): por Data/Hora da Busca desc, depois Preço asc
+    if "Data/Hora da Busca" in merged:
+        merged = merged.sort_values(by=["Data/Hora da Busca","Preço"], ascending=[False, True], ignore_index=True)
+
+    _save_master_out(merged)
 
 # ── 1 ciclo de atualização ────────────────────────────────────────────────────
 def run_cycle():
     pdfs = sorted(glob.glob(os.path.join(PDF_DIR, "*.pdf")))
     print(f"[{datetime.now():%H:%M:%S}] PDFs na pasta: {len(pdfs)}")
     if not pdfs:
+        # Ainda assim, garante que master-out exista (copiando master atual, se houver)
+        master = _load_master_df()
+        if not master.empty:
+            _save_master_out(master)
         return pd.DataFrame(), pd.DataFrame(), 0, 0
 
     # Cache simples (mtime+tamanho)
@@ -292,6 +334,10 @@ def run_cycle():
 
     if not to_process:
         print(f"[{datetime.now():%H:%M:%S}] Nada novo. Todos os PDFs já convertidos.")
+        # Ainda assim, mantenha o master atualizado a partir do que já existe no repo
+        master = _load_master_df()
+        if not master.empty:
+            _save_master_out(master)
         return pd.DataFrame(), pd.DataFrame(), 0, 0
 
     print(f"[{datetime.now():%H:%M:%S}] Novos/alterados: {len(to_process)} de {len(pdfs)}")
@@ -318,9 +364,11 @@ def run_cycle():
                 "TRECHO": get_trecho(fn)
             })
 
+    # DataFrames “novos”
     new_offers_df = pd.DataFrame(offers_rows)
     new_erros_df  = pd.DataFrame(errors_rows)
 
+    # Limpeza, ADVP, ranking, filtros
     if not new_offers_df.empty:
         new_offers_df["Data do Voo"] = pd.to_datetime(new_offers_df["Data do Voo"], dayfirst=True, errors="coerce")
         so_data = new_offers_df["Data/Hora da Busca"].astype(str).str.extract(r"(\d{2}/\d{2}/\d{4})", expand=False)
@@ -339,42 +387,30 @@ def run_cycle():
     if not new_erros_df.empty:
         new_erros_df = to_upper_df(new_erros_df)
 
-    try: base_ofertas = pd.read_excel(MATRIX_XLSX, sheet_name=SHEET_OFERTAS, engine="openpyxl")
-    except: base_ofertas = pd.DataFrame()
-    try: base_erros = pd.read_excel(MATRIX_XLSX, sheet_name=SHEET_ERROS, engine="openpyxl")
-    except: base_erros = pd.DataFrame()
+    # Grava Excel incremental + Parquet de erros
+    try:
+        base_ofertas = pd.read_excel(MATRIX_XLSX, sheet_name=SHEET_OFERTAS, engine="openpyxl")
+    except Exception:
+        base_ofertas = pd.DataFrame()
+    try:
+        base_erros = pd.read_excel(MATRIX_XLSX, sheet_name=SHEET_ERROS, engine="openpyxl")
+    except Exception:
+        base_erros = pd.DataFrame()
 
-    base_cols = list(base_ofertas.columns) if not base_ofertas.empty else \
-        ["Nome do Arquivo","Companhia Aérea","Horário1","Horário2","Horário3",
-         "Tipo de Voo","Data do Voo","Data/Hora da Busca","Agência/Companhia",
-         "Preço","TRECHO","ADVP","Ranking"]
-    err_cols = list(base_erros.columns) if not base_erros.empty else ["Nome do Arquivo","Erro","Trecho","Pagina","EM_AMBAS"]
+    final_ofertas = pd.concat([base_ofertas, new_offers_df], ignore_index=True) if not new_offers_df.empty else base_ofertas
+    final_erros   = pd.concat([base_erros, new_erros_df], ignore_index=True) if not new_erros_df.empty else base_erros
 
-    novos_unicos = new_offers_df.copy() if not new_offers_df.empty else pd.DataFrame()
-    new_errs_unique = new_erros_df.copy() if not new_erros_df.empty else pd.DataFrame()
-
-    if not novos_unicos.empty:
-        for c in base_cols:
-            if c not in novos_unicos.columns: novos_unicos[c] = pd.NA
-        novos_unicos = novos_unicos[base_cols]
-    if not new_errs_unique.empty:
-        if "EM_AMBAS" not in new_errs_unique.columns: new_errs_unique["EM_AMBAS"] = pd.NA
-        for c in err_cols:
-            if c not in new_errs_unique.columns: new_errs_unique[c] = pd.NA
-        new_errs_unique = new_errs_unique[err_cols]
-
-    final_ofertas = pd.concat([base_ofertas, novos_unicos], ignore_index=True) if not novos_unicos.empty else base_ofertas
-    final_erros   = pd.concat([base_erros, new_errs_unique], ignore_index=True) if not new_errs_unique.empty else base_erros
-
-    if not final_erros.empty:
-        ofertas_set = set(final_ofertas["Nome do Arquivo"].dropna().astype(str)) if "Nome do Arquivo" in final_ofertas else set()
-        final_erros["EM_AMBAS"] = final_erros["Nome do Arquivo"].apply(lambda x: "SIM" if str(x) in ofertas_set else "NÃO")
-
-    if not novos_unicos.empty or not new_errs_unique.empty or base_ofertas.empty or base_erros.empty:
+    # Excel e erros parquet (meramente para auditoria)
+    if not final_ofertas.empty or base_ofertas.empty:
         write_back_preserving(MATRIX_XLSX, final_ofertas, final_erros)
-        export_parquet(final_ofertas, final_erros)
+    if not new_erros_df.empty:
+        _to_datetime_cols(new_erros_df).to_parquet(PARQUET_ERR, index=False)
 
-    # Atualiza cache SEM ERRO DE SINTAXE (😀)
+    # >>> NOVO: salva incremento e atualiza base-mãe sem duplicar
+    export_increment_and_update_master(new_offers_df)
+
+    # Atualiza cache
+    state = load_state()
     for p in to_process:
         try:
             st = os.stat(p)
@@ -383,7 +419,7 @@ def run_cycle():
             pass
     save_state(state)
 
-    return final_ofertas, final_erros, len(novos_unicos), len(new_errs_unique)
+    return final_ofertas, final_erros, len(new_offers_df), len(new_erros_df)
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
