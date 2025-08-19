@@ -2,15 +2,30 @@ name: Puxar arquivos do Drive
 
 on:
   schedule:
-    - cron: "*/10 * * * *"    # a cada 10 minutos (UTC)
-  workflow_dispatch:          # botão manual
+    - cron: "*/15 * * * *"   # roda a cada 15min (UTC). Ajuste se quiser.
+  workflow_dispatch: {}
+
+concurrency:
+  group: pull-drive
+  cancel-in-progress: true
+
+permissions:
+  contents: write    # necessário para commitar o parquet
 
 jobs:
   pull:
     runs-on: ubuntu-latest
+
+    env:
+      MAX_FILES: "100"        # limite de arquivos por run (0 = sem limite)
+      SINCE_HOURS: "72"       # últimos N horas (0 = sem filtro)
+      FORCE_REDOWNLOAD: "0"   # "1" para ignorar o skip por parquet-mãe e baixar tudo
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -26,14 +41,54 @@ jobs:
         run: |
           echo "$GDRIVE_SA_JSON" > sa.json
 
-      - name: Baixar do Drive
+      - name: Baixar do Drive (pula o que já está no OFERTAS.parquet)
         env:
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          MAX_FILES: ${{ env.MAX_FILES }}
+          SINCE_HOURS: ${{ env.SINCE_HOURS }}
+          FORCE_REDOWNLOAD: ${{ env.FORCE_REDOWNLOAD }}
         run: |
           python scripts/drive_pull.py
 
-      - name: Publicar arquivos como Artifact
+      - name: Converter PDFs (gera incremento + base-mãe atualizada)
+        run: |
+          mkdir -p out
+          python scripts/pdf27.py --once
+
+      - name: Publicar originais como Artifact
         uses: actions/upload-artifact@v4
         with:
           name: drive-inbox
           path: inbox/**
+          if-no-files-found: warn
+
+      - name: Publicar convertidos como Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: converted-files
+          path: out/**
+          if-no-files-found: warn
+
+      - name: Commit OFERTAS.parquet no repositório (raiz)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          if [ -f out/OFERTAS.parquet ]; then
+            cp -f out/OFERTAS.parquet OFERTAS.parquet
+          else
+            echo "OFERTAS.parquet não encontrado em out/"
+            exit 1
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add OFERTAS.parquet || true
+          if git diff --cached --quiet; then
+            echo "Sem mudanças no Parquet — não vou commitar."
+            exit 0
+          fi
+
+          git commit -m "chore(data): update OFERTAS.parquet [skip ci]"
+          git push origin HEAD:main
