@@ -9,7 +9,6 @@ from tqdm import tqdm
 from openpyxl.utils import get_column_letter
 
 # ── CONFIGS ───────────────────────────────────────────────────────────────────
-# Caminhos RELATIVOS pro GitHub Actions
 ROOT = Path(".")
 PDF_DIR        = str(ROOT / "inbox")   # onde os PDFs baixam
 OUT_DIR        = ROOT / "out"
@@ -18,19 +17,15 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 MATRIX_XLSX    = str(OUT_DIR / "OFERTASMATRIZ.xlsx")
 PARQUET_OFS    = str(OUT_DIR / "OFERTASMATRIZ_OFERTAS.parquet")
 PARQUET_ERR    = str(OUT_DIR / "OFERTASMATRIZ_ERROS.parquet")
+REPLACE_OFERTAS_PATH = str(OUT_DIR / "OFERTAS.parquet")
 
 SHEET_OFERTAS  = "OFERTAS"
 SHEET_ERROS    = "ERRO_MONITORAMENTO"
 
-# Arquivos auxiliares
 ROW_IDS_FILE   = str(OUT_DIR / "OFERTASMATRIZ_ROW_IDS.txt")
 ERR_IDS_FILE   = str(OUT_DIR / "OFERTASMATRIZ_ERR_IDS.txt")
 STATE_JSON     = str(OUT_DIR / "OFERTASMATRIZ_STATE.json")
 
-# Parquet “final” pedido
-REPLACE_OFERTAS_PATH = str(OUT_DIR / "OFERTAS.parquet")
-
-# (se você rodar sem --once) intervalo
 LOOP_INTERVAL_SEC = 10 * 60
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -49,7 +44,6 @@ VALID_ENTITIES = {
 AIRLINES = ["gol","latam","azul","voepass","jetsmart","airfrance","unitedairlines",
             "iberia","lufthansa","aeromexico","aircanada","americanairlines","tap"]
 
-# Regras
 dates_regex   = re.compile(r"(\d{2}/\d{2}/\d{4},\s*\d{2}:\d{2})")
 price_regex   = re.compile(r"R\$\s*([\d\s\.,]+)")
 CUTOFF_OFFERS = "complemente sua viagem"
@@ -67,7 +61,6 @@ PAGE_ERROR_PATTERNS = {
 }
 MONTH_MAP = {"jan":1,"fev":2,"mar":3,"abr":4,"mai":5,"jun":6,"jul":7,"ago":8,"set":9,"out":10,"nov":11,"dez":12}
 
-# ── Helpers de normalização/ID ────────────────────────────────────────────────
 OF_ID_COLS = [
     "Nome do Arquivo","Companhia Aérea","Horário1","Horário2","Horário3",
     "Tipo de Voo","Data do Voo","Data/Hora da Busca","Agência/Companhia",
@@ -280,7 +273,7 @@ def run_cycle():
     if not pdfs:
         return pd.DataFrame(), pd.DataFrame(), 0, 0
 
-    # Cache simples (mtime+tamanho) para processar só novos/alterados
+    # Cache simples (mtime+tamanho)
     state = load_state()
     def _sig(p: str) -> str | None:
         try:
@@ -328,7 +321,6 @@ def run_cycle():
     new_offers_df = pd.DataFrame(offers_rows)
     new_erros_df  = pd.DataFrame(errors_rows)
 
-    # OFERTAS: datas, ADVP, ranking, filtros, maiúsculo
     if not new_offers_df.empty:
         new_offers_df["Data do Voo"] = pd.to_datetime(new_offers_df["Data do Voo"], dayfirst=True, errors="coerce")
         so_data = new_offers_df["Data/Hora da Busca"].astype(str).str.extract(r"(\d{2}/\d{2}/\d{4})", expand=False)
@@ -347,7 +339,6 @@ def run_cycle():
     if not new_erros_df.empty:
         new_erros_df = to_upper_df(new_erros_df)
 
-    # Base atual (se existir)
     try: base_ofertas = pd.read_excel(MATRIX_XLSX, sheet_name=SHEET_OFERTAS, engine="openpyxl")
     except: base_ofertas = pd.DataFrame()
     try: base_erros = pd.read_excel(MATRIX_XLSX, sheet_name=SHEET_ERROS, engine="openpyxl")
@@ -379,17 +370,37 @@ def run_cycle():
         ofertas_set = set(final_ofertas["Nome do Arquivo"].dropna().astype(str)) if "Nome do Arquivo" in final_ofertas else set()
         final_erros["EM_AMBAS"] = final_erros["Nome do Arquivo"].apply(lambda x: "SIM" if str(x) in ofertas_set else "NÃO")
 
-    # Grava Excel + Parquet (quando tem algo novo, ou base vazia)
     if not novos_unicos.empty or not new_errs_unique.empty or base_ofertas.empty or base_erros.empty:
         write_back_preserving(MATRIX_XLSX, final_ofertas, final_erros)
         export_parquet(final_ofertas, final_erros)
 
-    # Atualiza cache
-    state = load_state()
+    # Atualiza cache SEM ERRO DE SINTAXE (😀)
     for p in to_process:
         try:
             st = os.stat(p)
             state[p] = f"{st.st_size}-{int(st.st_mtime)}"
         except Exception:
             pass
-    save_state(sta_
+    save_state(state)
+
+    return final_ofertas, final_erros, len(novos_unicos), len(new_errs_unique)
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--once", action="store_true", help="Executa apenas 1 ciclo.")
+    args = ap.parse_args()
+
+    if args.once:
+        of_df, er_df, n_of, n_er = run_cycle()
+        print(f"✅ Ciclo concluído. Ofertas novas: {n_of} | Erros novos: {n_er}")
+    else:
+        while True:
+            try:
+                start = datetime.now()
+                of_df, er_df, n_of, n_er = run_cycle()
+                print(f"✅ Ciclo concluído {start:%d/%m %H:%M:%S}. Ofertas novas: {n_of} | Erros novos: {n_er}")
+            except Exception as e:
+                print(f"❌ Erro no ciclo: {e}")
+            print(f"⏲️ Próxima execução em 10 minutos.")
+            time.sleep(LOOP_INTERVAL_SEC)
