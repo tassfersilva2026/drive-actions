@@ -2,12 +2,12 @@ name: publish-ofertas-from-artifact
 
 on:
   workflow_run:
-    workflows: ["Puxar arquivos do Drive"]
+    workflows: ["Puxar arquivos do Drive"]   # nome amigável do SEU workflow (ok aqui)
     types: [completed]
   workflow_dispatch: {}
 
 permissions:
-  actions: read          # <-- ESSENCIAL pra listar/baixar artifacts de outras runs
+  actions: read         # <-- ESSENCIAL pra listar/baixar artifacts
   contents: read
   pages: write
   id-token: write
@@ -17,25 +17,24 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      # Quando for disparado automaticamente por workflow_run,
-      # baixa o artifact daquela execução:
+      # quando disparado automaticamente pelo workflow_run:
       - name: Download artifact (triggered run)
         if: ${{ github.event_name == 'workflow_run' }}
         uses: dawidd6/action-download-artifact@v6
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           run_id: ${{ github.event.workflow_run.id }}
-          name: converted-files
+          name: converted-files              # <- nome do artifact do seu upload (out/**)
           path: download
           if_no_artifact_found: fail
 
-      # Quando rodar manualmente, pega o último sucesso do workflow:
+      # quando rodar MANUALMENTE: use o NOME DO ARQUIVO .yml do workflow gerador
       - name: Download latest successful artifact (manual)
         if: ${{ github.event_name == 'workflow_dispatch' }}
         uses: dawidd6/action-download-artifact@v6
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          workflow: "Puxar arquivos do Drive"
+          workflow: ".github/workflows/puxar-drive.yml"   # <- ESTE filename
           workflow_conclusion: success
           branch: main
           name: converted-files
@@ -46,6 +45,7 @@ jobs:
         run: |
           set -e
           mkdir -p site
+          # pega OFERTAS.parquet (ou o 1º .parquet) do artifact (direto ou de dentro de .zip)
           PARQ=$(find download -type f -name 'OFERTAS.parquet' -o -name '*.parquet' | head -n1 || true)
           if [ -z "$PARQ" ]; then
             echo "Nenhum .parquet encontrado no artifact"; exit 1
