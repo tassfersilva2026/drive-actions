@@ -1,0 +1,2 @@
+pydrive2==1.19.0
+oauth2client==4.1.3
